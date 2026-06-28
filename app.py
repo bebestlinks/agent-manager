@@ -19,6 +19,7 @@ Claude מפענח לכלי -> ביצוע על סוכן הרווחה (עריכת 
 import os
 import re
 import json
+import time
 import base64
 import sqlite3
 import urllib.request
@@ -39,6 +40,9 @@ ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
 PRICE_IN_PER_M = 1.0
 PRICE_OUT_PER_M = 5.0
 USD_TO_ILS = 3.7
+
+# בלם בטיחות: מקסימום הודעות יוצאות בחלון זמן (מונע שליחה חופשית/ספאם)
+MAX_SENDS_PER_HOUR = int(os.environ.get("MAX_SENDS_PER_HOUR", "20"))
 
 
 # ---------- אחסון (SQLite) ----------
@@ -63,7 +67,26 @@ def _db():
         agent TEXT, month TEXT, ai_tokens INTEGER DEFAULT 0,
         messages INTEGER DEFAULT 0, cost_ils REAL DEFAULT 0,
         PRIMARY KEY(agent, month))""")
+    conn.execute("CREATE TABLE IF NOT EXISTS sends(ts INTEGER)")
     return conn
+
+
+def within_rate_limit():
+    """בודק שלא חרגנו ממכסת השליחות בשעה האחרונה."""
+    conn = _db()
+    cutoff = int(time.time()) - 3600
+    conn.execute("DELETE FROM sends WHERE ts < ?", (cutoff,))
+    n = conn.execute("SELECT COUNT(*) FROM sends").fetchone()[0]
+    conn.commit()
+    conn.close()
+    return n < MAX_SENDS_PER_HOUR
+
+
+def record_send():
+    conn = _db()
+    conn.execute("INSERT INTO sends(ts) VALUES(?)", (int(time.time()),))
+    conn.commit()
+    conn.close()
 
 
 def log_usage(agent, in_tok, out_tok, messages=0):
@@ -170,12 +193,17 @@ def act_set_holiday(holiday, active):
 
 # ---------- PayCall שליחה ----------
 def send_whatsapp(to, text):
+    # בלם בטיחות: לא חורגים ממכסת השליחות בשעה
+    if not within_rate_limit():
+        print(f"RATE LIMIT reached ({MAX_SENDS_PER_HOUR}/h) - blocked send to {to}")
+        return 0
     payload = json.dumps({"method": "sendMessage", "token": PAYCALL_TOKEN,
                           "phone": to, "body": text}).encode("utf-8")
     req = urllib.request.Request("https://wapp.callindex.co.il/", data=payload,
                                  headers={"Content-Type": "application/json"}, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
+            record_send()
             return r.status
     except Exception as e:
         print("send error:", e)
@@ -292,7 +320,8 @@ def webhook():
     if from_me or not text:
         return "ignored", 200
     if not is_authorized(sender):
-        send_whatsapp(sender, "מצטער, אין לך הרשאה לשוחח עם מנהל הסוכנים.")
+        # שתיקה מוחלטת לבלתי-מורשים - לא שולחים שום תגובה (מונע ספאם לאנשי קשר)
+        print(f"ignored unauthorized sender: {sender}")
         return "unauthorized", 200
     try:
         reply = handle_message(text)
@@ -302,6 +331,76 @@ def webhook():
     send_whatsapp(sender, reply)
     log_usage("manager", 0, 0, messages=1)
     return "ok", 200
+
+
+# ---------- דיווח שימוש מסוכנים אחרים ----------
+@app.route("/report", methods=["POST"])
+def report():
+    """כל סוכן מדווח שימוש: {key, agent, in_tokens, out_tokens, messages}."""
+    data = request.get_json(silent=True) or request.form.to_dict() or {}
+    if str(data.get("key", "")) != ADMIN_PHONE:
+        return "unauthorized", 403
+    log_usage(str(data.get("agent", "unknown")),
+              int(data.get("in_tokens", 0) or 0),
+              int(data.get("out_tokens", 0) or 0),
+              int(data.get("messages", 0) or 0))
+    return "ok", 200
+
+
+# ---------- דשבורד בקרה ----------
+@app.route("/dashboard", methods=["GET"])
+def dashboard():
+    if request.args.get("key", "") != ADMIN_PHONE:
+        return "unauthorized - add ?key=YOUR_ADMIN_PHONE", 403
+    conn = _db()
+    rows = conn.execute("SELECT agent, SUM(ai_tokens), SUM(messages), SUM(cost_ils) "
+                        "FROM usage GROUP BY agent ORDER BY SUM(cost_ils) DESC").fetchall()
+    month = datetime.now(timezone.utc).strftime("%Y-%m")
+    mrows = conn.execute("SELECT agent, ai_tokens, messages, cost_ils FROM usage "
+                         "WHERE month=? ORDER BY cost_ils DESC", (month,)).fetchall()
+    conn.close()
+
+    total_cost = sum((r[3] or 0) for r in rows)
+    total_tok = sum((r[1] or 0) for r in rows)
+    total_msg = sum((r[2] or 0) for r in rows)
+    top = rows[0][0] if rows else "—"
+
+    def table(data, cols):
+        h = "<tr>" + "".join(f"<th>{c}</th>" for c in cols) + "</tr>"
+        b = ""
+        for r in data:
+            mark = " class='top'" if (r[0] == top and len(r) == 4) else ""
+            b += f"<tr{mark}><td>{r[0]}</td><td>{int(r[1] or 0):,}</td>" \
+                 f"<td>{int(r[2] or 0)}</td><td>₪{(r[3] or 0):.2f}</td></tr>"
+        return f"<table>{h}{b}</table>"
+
+    html = f"""<!DOCTYPE html><html lang="he" dir="rtl"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>דשבורד הסוכנים</title><style>
+body{{font-family:system-ui,Arial;background:#0f1420;color:#e8edf6;margin:0;padding:24px}}
+h1{{font-size:22px}} h2{{color:#9aa7bd;font-size:15px;margin-top:28px}}
+.kpis{{display:flex;gap:14px;flex-wrap:wrap;margin:16px 0}}
+.kpi{{background:#171f2e;border:1px solid #2a3650;border-radius:12px;padding:12px 18px;min-width:130px}}
+.kpi .v{{font-size:22px;font-weight:700}} .kpi .l{{font-size:12px;color:#9aa7bd}}
+table{{width:100%;border-collapse:collapse;background:#171f2e;border:1px solid #2a3650;border-radius:10px;overflow:hidden}}
+th,td{{text-align:right;padding:10px;border-bottom:1px solid #2a3650;font-size:14px}}
+th{{color:#9aa7bd}} tr.top td{{background:rgba(251,191,36,.12)}}
+.muted{{color:#9aa7bd;font-size:12px;margin-top:18px}}</style></head><body>
+<h1>🛰️ דשבורד הסוכנים</h1>
+<div class="kpis">
+<div class="kpi"><div class="v">{len(rows)}</div><div class="l">סוכנים</div></div>
+<div class="kpi"><div class="v">{total_msg}</div><div class="l">הודעות (סה"כ)</div></div>
+<div class="kpi"><div class="v">{int(total_tok):,}</div><div class="l">טוקני AI (סה"כ)</div></div>
+<div class="kpi"><div class="v">₪{total_cost:.2f}</div><div class="l">עלות כוללת</div></div>
+<div class="kpi"><div class="v">🔥 {top}</div><div class="l">הכי בזבזן</div></div>
+</div>
+<h2>סיכום כולל לפי סוכן</h2>
+{table(rows, ["סוכן","טוקני AI","הודעות","עלות"])}
+<h2>החודש ({month})</h2>
+{table(mrows, ["סוכן","טוקני AI","הודעות","עלות"])}
+<p class="muted">עלויות מוערכות לפי מחירון. רענן את הדף לנתונים עדכניים.</p>
+</body></html>"""
+    return html
 
 
 if __name__ == "__main__":
